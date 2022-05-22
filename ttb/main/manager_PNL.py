@@ -3,6 +3,7 @@ import time
 from ttb.cfg.config import Config
 from ttb.data.event_type import EventType
 from ttb.data.pnl_type import PnlType
+from ttb.event.inbound.eod_price_reader import PriceReader
 from ttb.event.inbound.rpa_alert_reader import AlertReader
 from ttb.event.outbound.to_file_event import ToFileEventHandler
 from ttb.report.pnl_report import PnlReporter
@@ -13,7 +14,7 @@ import threading
 from ttb.util import timeutil
 from ttb.util.app_logging import getLogger
 
-logger = getLogger_rpa('ttb.main.bot_manager_rpa')
+logger = getLogger('ttb.main.bot_manager_pnl')
 
 
 class BotManager:
@@ -24,7 +25,7 @@ class BotManager:
         self.__default_qty = self.__conf.trade_default_qty
         self.__total_amt = 0
         self.trading_end_time = timeutil.parse_time(self.__conf.trade_end_time)
-        self.__long_positions = {}
+        self.long_positions = {}
         self.__executions = {}
         self.__pnl = {}
         self.__alert_reader = AlertReader(self.__conf, self.__event_q)
@@ -49,7 +50,7 @@ class BotManager:
                 event = self.__event_q.get()
                 self.__on_event(event)
             time.sleep(5)
-        #self.eod_process()
+        self.eod_process()
         self.gen_reports()
 
     def __on_event(self, event):
@@ -79,12 +80,12 @@ class BotManager:
         if sym_price_pairs:
             for ticker_price in sym_price_pairs:
                 ticker = ticker_price['symbol']
-                if side == 'BUY' and ticker not in self.__long_positions:
+                if side == 'BUY' and (version not in self.long_positions or ticker not in self.long_positions[version]):
                     price_b = float(ticker_price['last'])
                     if price_b:
                         buy_qty = self.calc_qty(price_b)
                         if buy_qty:
-                            self.__long_positions.setdefault(version, dict())[ticker] = {'price': float(price_b),
+                            self.long_positions.setdefault(version, dict())[ticker] = {'price': float(price_b),
                                                                                          'qty': buy_qty,
                                                                                          'exec_time': ts,
                                                                                          'alert_buy_ts': ts,
@@ -107,13 +108,13 @@ class BotManager:
                             logger.info(f"# of shares < 1, skipped buy for : {ticker}")
                     else:
                         logger.error(f'failed to execute buy for : {ticker}')
-                elif side == 'SELL' and version in self.__long_positions and ticker in self.__long_positions[version]:
+                elif side == 'SELL' and version in self.long_positions and ticker in self.long_positions[version]:
                     price_s = ticker_price['last']
                     if price_s:
                         price_sold = float(price_s)
-                        exec_b = self.__long_positions[version].pop(ticker)
-                        if len(self.__long_positions[version]) == 0:
-                            self.__long_positions.pop(version)
+                        exec_b = self.long_positions[version].pop(ticker)
+                        if len(self.long_positions[version]) == 0:
+                            self.long_positions.pop(version)
                         price_bought = exec_b['price']
                         bought_time = exec_b['exec_time']
                         alert_b_ts = exec_b['alert_buy_ts']
@@ -174,27 +175,20 @@ class BotManager:
             logger.exception(f'error getting price for {ticker}')
         return None
 
-    def get_prices(self, tickers: list):
-        logger.info(f'getting price for {tickers}')
-        prices = {}
-        try:
-            quotes = self.__trader.get_quotes(tickers)
-            if quotes:
-                for t, q in quotes.items():
-                    prices[t] = q['lastPrice']
-        except Exception:
-            logger.exception(f'error getting price for {tickers}')
-        return prices
+    def get_prices(self):
+        p_reader = PriceReader(self.__conf)
+        eod_prices = p_reader.read()
+        return eod_prices
 
     def publish_event(self, event: dict):
         e_type = event['event_type']
         self.__event_handler.handle_event(event)
         if e_type == EventType.TRADE:
-            payload = dict(event_type=EventType.POSITIONS, positions=self.__long_positions)
+            payload = dict(event_type=EventType.POSITIONS, positions=self.long_positions)
             self.__event_handler.handle_event(payload)
 
     def show_statistics(self):
-        logger.info(f'current positions : {self.__long_positions}')
+        logger.info(f'current positions : {self.long_positions}')
         logger.info('current PNLs summary ...')
         pnl_display = ""
         for (t, pnls) in self.__pnl.items():
@@ -213,32 +207,34 @@ class BotManager:
 
     def eod_process(self):
         logger.info('eod process ...')
-        if len(self.__long_positions) > 0:
-            for (ver, positions) in self.__long_positions.items():
-                tickers = list(positions.keys())
-                eod_prices = self.get_prices(tickers)
+        if len(self.long_positions) > 0:
+            for (ver, positions) in self.long_positions.items():
+                eod_prices = self.get_prices()
                 for t, p in eod_prices.items():
-                    price_bought = positions[t]['price']
-                    qty = positions[t]['qty']
-                    alert_b_ts = positions[t]['alert_buy_ts']
-                    pct_chg = round(100 * (p - price_bought) / price_bought, ndigits=4)
-                    pnl = dict(
-                        event_type=EventType.PNL,
-                        ticker=t,
-                        price_bought=price_bought,
-                        price_sold=p,
-                        price_chg_pct=pct_chg,
-                        qty=qty,
-                        time_bought=positions[t]['exec_time'],
-                        time_sold='EOD',
-                        alert_buy_ts=alert_b_ts,
-                        alert_sell_ts="N/A",
-                        buy_scanner=positions[t]['scanner'],
-                        sell_scanner='EOD',
-                        version=ver,
-                        pnl_type=PnlType.UN_REALIZED.name
-                    )
-                    self.__pnl.setdefault(t, list()).append(pnl)
+                    if t in positions:
+                        price_bought = positions[t]['price']
+                        qty = positions[t]['qty']
+                        alert_b_ts = positions[t]['alert_buy_ts']
+                        pct_chg = round(100 * (p - price_bought) / price_bought, ndigits=4)
+                        pnl = dict(
+                            event_type=EventType.PNL,
+                            ticker=t,
+                            price_bought=price_bought,
+                            price_sold=p,
+                            price_chg_pct=pct_chg,
+                            qty=qty,
+                            time_bought=positions[t]['exec_time'],
+                            time_sold='EOD',
+                            alert_buy_ts=alert_b_ts,
+                            alert_sell_ts="N/A",
+                            buy_scanner=positions[t]['scanner'],
+                            sell_scanner='EOD',
+                            version=ver,
+                            pnl_type=PnlType.UN_REALIZED.name
+                        )
+                        self.__pnl.setdefault(t, list()).append(pnl)
+                    else:
+                        logger.error(f'EOD price not found for ticker {t}')
 
     def add_pnl(self, pnl: dict):
         self.__pnl.setdefault(pnl['ticker'], list()).append(pnl)
@@ -247,14 +243,34 @@ class BotManager:
         return self.__pnl
 
     def add_position(self, pos: dict):
-        self.__long_positions.update(pos)
+        self.long_positions.update(pos)
 
     def calc_qty(self, price_b):
         return self.__default_qty
         #max_buy_amt = min(self.__per_trade_amt_limit, self.__daily_trade_amt_limit-self.__total_amt)
         #return min(self.__default_qty, max_buy_amt//price_b)
 
+def test_eod_price():
+    botManager.long_positions = {}
+    botManager.long_positions['V5.4'] = {}
+    botManager.long_positions['V5.4']['LIT'] = {}
+    botManager.long_positions['V5.4']['LIT']['price'] = 116.0
+    botManager.long_positions['V5.4']['LIT']['qty'] = 100
+    botManager.long_positions['V5.4']['LIT']['version'] = 'V5.4'
+    botManager.long_positions['V5.4']['LIT']['alert_buy_ts'] = '2022/05/13-09:57:14'
+    botManager.long_positions['V5.4']['LIT']['exec_time'] = '2022/05/13-09:57:14'
+    botManager.long_positions['V5.4']['LIT']['scanner'] = '#B4#V5.4#'
+
+    botManager.long_positions['V5.4']['LCID'] = {}
+    botManager.long_positions['V5.4']['LCID']['price'] = 17.1
+    botManager.long_positions['V5.4']['LCID']['qty'] = 100
+    botManager.long_positions['V5.4']['LCID']['version'] = 'V5.4'
+    botManager.long_positions['V5.4']['LCID']['alert_buy_ts'] = '2022/05/13-09:57:14'
+    botManager.long_positions['V5.4']['LCID']['exec_time'] = '2022/05/13-09:57:14'
+    botManager.long_positions['V5.4']['LCID']['scanner'] = '#B4#V5.4#'
+    botManager.eod_process()
 
 if __name__ == "__main__":
     botManager = BotManager()
     botManager.start()
+
